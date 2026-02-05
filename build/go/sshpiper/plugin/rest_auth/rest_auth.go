@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"crypto/tls"
 	"fmt"
+	"strings"
 	"github.com/tg123/sshpiper/libplugin"
 	"golang.org/x/crypto/ssh"
 )
@@ -24,6 +25,15 @@ type piperTo struct {
 	PrivateKey string
 }
 
+// Password verification response from orchestrator
+type passwordAuthResponse struct {
+	Valid      bool   `json:"valid"`
+	User       string `json:"user"`
+	Host       string `json:"host"`
+	PrivateKey string `json:"privateKey"`
+	Error      string `json:"error"`
+}
+
 func newRestAuthPlugin() *plugin{
 	return &plugin{}
 }
@@ -32,7 +42,7 @@ func (p *plugin) supportedMethods() ([]string, error) {
 	set := make(map[string]bool)
 
 	set["publickey"] = true
-	set["password"] = false
+	set["password"] = true  // ENABLED: Password auth now supported
 
 	var methods []string
 	for k := range set {
@@ -44,6 +54,17 @@ func (p *plugin) supportedMethods() ([]string, error) {
 func (p *plugin) findAndCreateUpstream(conn libplugin.ConnMetadata, password string, publicKey []byte) (*libplugin.Upstream, error) {
 	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: p.Insecure}
 	user := conn.User()
+
+	// =========================================================================
+	// PASSWORD AUTH: POST password to orchestrator for verification
+	// =========================================================================
+	if password != "" && publicKey == nil {
+		return p.handlePasswordAuth(conn, user, password)
+	}
+
+	// =========================================================================
+	// PUBLIC KEY AUTH: GET routing info and verify key locally
+	// =========================================================================
 	resp, err := http.Get(p.URL + fmt.Sprintf("/%s", url.QueryEscape(user)))
 	if err != nil {
 		return nil, err
@@ -83,6 +104,64 @@ func (p *plugin) findAndCreateUpstream(conn libplugin.ConnMetadata, password str
 		return nil, err
 	}
 	return nil, fmt.Errorf("no matching pipe for username [%v] found", user)
+}
+
+// handlePasswordAuth POSTs the password to the orchestrator for verification
+func (p *plugin) handlePasswordAuth(conn libplugin.ConnMetadata, sandboxId string, password string) (*libplugin.Upstream, error) {
+	// POST to orchestrator's password verification endpoint
+	// URL format: POST {baseURL}/{sandboxId}/password
+	authURL := p.URL + fmt.Sprintf("/%s/password", url.QueryEscape(sandboxId))
+	
+	// Create request body
+	reqBody := map[string]string{
+		"password": password,
+	}
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal password request: %v", err)
+	}
+	
+	// Send POST request
+	resp, err := http.Post(authURL, "application/json", strings.NewReader(string(jsonBody)))
+	if err != nil {
+		return nil, fmt.Errorf("password verification request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	
+	// Read response
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read password response: %v", err)
+	}
+	
+	// Handle non-200 responses
+	if resp.StatusCode != 200 {
+		var errResult map[string]interface{}
+		json.Unmarshal(body, &errResult)
+		if errMsg, ok := errResult["error"].(string); ok {
+			return nil, fmt.Errorf("password auth failed: %s", errMsg)
+		}
+		return nil, fmt.Errorf("password auth failed with status %d", resp.StatusCode)
+	}
+	
+	// Parse successful response
+	var authResp passwordAuthResponse
+	if err := json.Unmarshal(body, &authResp); err != nil {
+		return nil, fmt.Errorf("failed to parse password auth response: %v", err)
+	}
+	
+	if !authResp.Valid {
+		return nil, fmt.Errorf("invalid password")
+	}
+	
+	// Create upstream connection
+	to := piperTo{
+		User:       authResp.User,
+		Host:       authResp.Host,
+		PrivateKey: authResp.PrivateKey,
+	}
+	
+	return p.createUpstream(conn, to)
 }
 
 func (p *plugin) createUpstream(conn libplugin.ConnMetadata, to piperTo) (*libplugin.Upstream, error) {
