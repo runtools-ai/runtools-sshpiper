@@ -24,5 +24,5 @@ This repo is a low-level sshpiper image/plugin fork and reference repo. Most Run
 - `compose.yml` as example vendor compose, not live platform compose
 
 ## Repo skills
-- `.claude/skills/repo-context/SKILL.md`
-- `.claude/skills/ssh-plugin-contract/SKILL.md`
+- `.agents/skills/repo-context/SKILL.md`
+- `.agents/skills/ssh-plugin-contract/SKILL.md`
